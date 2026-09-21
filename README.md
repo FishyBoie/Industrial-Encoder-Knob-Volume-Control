@@ -1,7 +1,10 @@
 # Industrial-Encoder-Knob-Volume-Control
 just a yaml code vibe coded via claude
+Yt-Video:
+https://youtu.be/-hrqFqxZjb8
 
-
+3dModel:
+https://makerworld.com/en/models/3339580-smart-volume-knob-industrial-encorder#profileId-3793769
 
 Parts:
 
