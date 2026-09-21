@@ -1,0 +1,661 @@
+# ═══════════════════════════════════════════════════════════════
+# ROBOT FACE KNOB — full ESPHome config
+#
+# Replace media_player_entity below with your own media_player
+# entity id from Home Assistant. That's the only personal info
+# this config needs.
+#
+# If anything doesn't work, just ask Claude (claude.ai) — paste
+# this file in and describe the issue.
+# ═══════════════════════════════════════════════════════════════
+
+substitutions:
+  # ---- REPLACE THIS with your own media_player entity id ----
+  media_player_entity: "media_player.YOUR_MEDIA_PLAYER"
+
+  volume_increment: "62.5"      # pulses per volume_up/volume_down step
+  pulses_per_pixel: "62.5"      # pulses per LED ring step (16 px * 62.5 = 1000 = one full revolution)
+  pixel_trail_time_ms: "1000"   # ms for a lit trail pixel to fade to off
+  buzzer_pulses: "62.5"         # pulses per buzzer blip
+  buzzer_hz: "4068Hz"           # fixed blip tone frequency (no runtime slider anymore)
+  buzzer_blip_ms: "1ms"        # blip duration
+  max_steps_per_event: "5"      # safety cap so one fast flick can't fire dozens of calls at once
+  num_pixels: "16"
+  led_fade_in_ms: "40"          # quick ramp-up so a lit pixel doesn't just pop to full brightness
+
+  # -- robot face timing --
+  blink_close_ms: "90"          # blink: closing half
+  blink_open_ms: "90"           # blink: opening half
+  blink_interval_min_ms: "2500" # gap between blink clusters, minimum
+  blink_interval_max_ms: "7000" # gap between blink clusters, maximum
+  dance_bob_amp_px: "3"         # vertical bob amplitude while media plays
+  dance_period_ms: "450"        # dance bob/squash period
+
+  # -- eye appearance (base size before any expression tweaks it) --
+  eye_width: "34"
+  eye_height: "34"
+  eye_gap: "14"
+  eye_corner_radius: "6"
+  eye_center_y: "28"            # resting vertical center of the eyes
+
+  # -- expression scheduler: how often SOME expression fires --
+  expr_interval_min_ms: "1500"  # gap between expression events, minimum
+  expr_interval_max_ms: "5000"  # gap between expression events, maximum
+
+  # -- expression: LOOK (pair slides around + a lopsided lean, held longer) --
+  eye_move_range_x_px: "18"     # how far left/right the eyes can drift
+  eye_move_range_y_px: "8"      # how far up/down the eyes can drift
+  eye_move_duration_min_ms: "900"
+  eye_move_duration_max_ms: "2200"
+  eye_lean_big_scale: "1.12"    # leading eye grows to this multiple (kept modest on purpose)
+  eye_lean_small_scale: "0.85"  # trailing eye shrinks to this multiple (kept modest on purpose)
+
+  # -- expression: HALF-OPEN (sleepy droop, never fully closes) --
+  half_open_amount: "0.45"      # eyelids ease down to cover this fraction of the eye
+  half_open_duration_min_ms: "900"
+  half_open_duration_max_ms: "1900"
+
+  # -- occasional cute smile at the bottom of the screen --
+  smile_probability_pct: "40"   # chance (out of 100) the smile actually shows each time it's "up"
+  smile_interval_min_ms: "4000" # how often we roll the dice for a smile
+  smile_interval_max_ms: "9000"
+  smile_duration_min_ms: "1200"
+  smile_duration_max_ms: "2500"
+  smile_radius_px: "11"
+  smile_center_y: "55"
+
+  # -- volume page --
+  volume_page_ms: "1800"        # how long the dedicated volume page stays up after a change
+  oled_normal_interval: "100ms" # YAML update_interval (needs a time unit)
+  oled_volume_interval: "250ms" # YAML update_interval (needs a time unit)
+  oled_normal_interval_num: "100" # same value, bare number for the C++ set_update_interval() call
+  oled_volume_interval_num: "250" # same value, bare number for the C++ set_update_interval() call
+
+globals:
+  # -- volume stepping --
+  - id: g_last_count
+    type: int
+    initial_value: '0'
+  - id: g_pulse_accum
+    type: float
+    initial_value: '0'
+  - id: g_pending_steps
+    type: int
+    initial_value: '0'
+  - id: g_step_direction
+    type: int
+    initial_value: '0'
+
+  # -- LED ring trail --
+  - id: g_pixel_accum
+    type: float
+    initial_value: '0'
+  - id: g_pixel_index
+    type: int
+    initial_value: '0'
+  - id: g_pixel_last_set
+    type: uint32_t[16]
+    initial_value: '{0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}'
+
+  # -- buzzer --
+  - id: g_buzzer_accum
+    type: float
+    initial_value: '0'
+  - id: g_pending_buzz
+    type: int
+    initial_value: '0'
+
+  # -- volume state (for display) --
+  - id: g_current_volume
+    type: float
+    initial_value: '0.5'
+  - id: g_last_volume_change_ms
+    type: uint32_t
+    initial_value: '0'
+  - id: g_volume_direction     # +1 = last change was up, -1 = down
+    type: int
+    initial_value: '0'
+  - id: g_was_vol_recent       # tracks edges so we only toggle the OLED refresh rate on change
+    type: bool
+    initial_value: 'false'
+
+  # -- blink state (runs continuously now, no clock mode to interrupt it) --
+  - id: g_blink_active
+    type: bool
+    initial_value: 'false'
+  - id: g_blink_start_ms
+    type: uint32_t
+    initial_value: '0'
+  - id: g_blinks_remaining
+    type: int
+    initial_value: '1'
+  - id: g_next_blink_ms
+    type: uint32_t
+    initial_value: '3000'
+
+  # -- expression state: one of LOOK / HALF-OPEN at a time --
+  - id: g_expr_active
+    type: bool
+    initial_value: 'false'
+  - id: g_expr_type            # 0 = look, 1 = half-open
+    type: int
+    initial_value: '0'
+  - id: g_expr_start_ms
+    type: uint32_t
+    initial_value: '0'
+  - id: g_expr_duration_ms
+    type: uint32_t
+    initial_value: '0'
+  - id: g_expr_dx              # LOOK: target horizontal offset in px
+    type: int
+    initial_value: '0'
+  - id: g_expr_dy              # LOOK: target vertical offset in px
+    type: int
+    initial_value: '0'
+  - id: g_expr_dir             # LOOK: which eye leads (+1/-1)
+    type: int
+    initial_value: '0'
+  - id: g_next_expr_ms
+    type: uint32_t
+    initial_value: '2000'
+
+  # -- smile state: shows up sometimes, not every cycle --
+  - id: g_smile_active
+    type: bool
+    initial_value: 'false'
+  - id: g_smile_start_ms
+    type: uint32_t
+    initial_value: '0'
+  - id: g_smile_duration_ms
+    type: uint32_t
+    initial_value: '0'
+  - id: g_next_smile_ms
+    type: uint32_t
+    initial_value: '5000'
+
+# ─────────────────────────────────────────────
+# ROTARY ENCODER — drives volume steps, LED trail, and buzzer blips together
+# ─────────────────────────────────────────────
+sensor:
+  - platform: rotary_encoder
+    name: "Volume Knob"
+    id: volume_knob
+    pin_a: GPIO13
+    pin_b: GPIO14
+    publish_initial_value: true
+    restore_mode: ALWAYS_ZERO
+    on_value:
+      then:
+        - lambda: |-
+            int32_t delta = (int32_t)x - id(g_last_count);
+            id(g_last_count) = (int32_t)x;
+            if (delta == 0) return;
+            uint32_t now = millis();
+
+            // ---- volume stepping ----
+            id(g_pulse_accum) += delta;
+            int vol_steps = (int)(fabs(id(g_pulse_accum)) / ${volume_increment});
+            if (vol_steps > ${max_steps_per_event}) vol_steps = ${max_steps_per_event};
+            int vol_dir = (id(g_pulse_accum) > 0) ? 1 : -1;
+            id(g_pulse_accum) -= vol_steps * ${volume_increment} * vol_dir;
+            id(g_pending_steps) = vol_steps;
+            id(g_step_direction) = vol_dir;
+            if (vol_steps > 0) {
+              id(g_last_volume_change_ms) = now;
+              float nv = id(g_current_volume) + (vol_steps * 0.02f * vol_dir);
+              if (nv < 0.0f) nv = 0.0f;
+              if (nv > 1.0f) nv = 1.0f;
+              if (nv > id(g_current_volume)) id(g_volume_direction) = 1;
+              else if (nv < id(g_current_volume)) id(g_volume_direction) = -1;
+              id(g_current_volume) = nv;
+            }
+
+            // ---- LED ring trail stepping ----
+            id(g_pixel_accum) += delta;
+            int pix_steps = (int)(fabs(id(g_pixel_accum)) / ${pulses_per_pixel});
+            int pix_dir = (id(g_pixel_accum) > 0) ? 1 : -1;
+            id(g_pixel_accum) -= pix_steps * ${pulses_per_pixel} * pix_dir;
+            for (int i = 0; i < pix_steps; i++) {
+              id(g_pixel_index) = ((id(g_pixel_index) + pix_dir) % ${num_pixels} + ${num_pixels}) % ${num_pixels};
+              id(g_pixel_last_set)[id(g_pixel_index)] = now;
+            }
+
+            // ---- buzzer stepping ----
+            id(g_buzzer_accum) += delta;
+            int buz_steps = (int)(fabs(id(g_buzzer_accum)) / ${buzzer_pulses});
+            int buz_dir = (id(g_buzzer_accum) > 0) ? 1 : -1;
+            id(g_buzzer_accum) -= buz_steps * ${buzzer_pulses} * buz_dir;
+            id(g_pending_buzz) = buz_steps;
+        - repeat:
+            count: !lambda 'return id(g_pending_steps);'
+            then:
+              - if:
+                  condition:
+                    lambda: 'return id(g_step_direction) > 0;'
+                  then:
+                    - homeassistant.service:
+                        service: media_player.volume_up
+                        data:
+                          entity_id: ${media_player_entity}
+                  else:
+                    - homeassistant.service:
+                        service: media_player.volume_down
+                        data:
+                          entity_id: ${media_player_entity}
+        - repeat:
+            count: !lambda 'return id(g_pending_buzz);'
+            then:
+              - script.execute: buzzer_blip
+
+  # keeps g_current_volume in sync with the real HA state (no direction update here,
+  # since a resync after idle isn't a "volume change" that should trigger a face reaction)
+  - platform: homeassistant
+    id: ha_volume
+    entity_id: ${media_player_entity}
+    attribute: volume_level
+    on_value:
+      then:
+        - lambda: |-
+            id(g_current_volume) = x;
+
+# ─────────────────────────────────────────────
+# MEDIA STATE — drives the "dance" animation
+# ─────────────────────────────────────────────
+text_sensor:
+  - platform: homeassistant
+    id: media_state
+    entity_id: ${media_player_entity}
+
+# ─────────────────────────────────────────────
+# BUZZER — PWM tone blip, no rtttl, fixed frequency (no exposed slider)
+# ─────────────────────────────────────────────
+output:
+  - platform: ledc
+    pin: GPIO25
+    id: buzzer_pwm
+    frequency: ${buzzer_hz}
+
+script:
+  - id: buzzer_blip
+    mode: restart
+    then:
+      # gated by the "Buzzer" switch below — does nothing while it's off
+      - if:
+          condition:
+            switch.is_on: buzzer_enable
+          then:
+            - output.set_level:
+                id: buzzer_pwm
+                level: 50%
+            - delay: ${buzzer_blip_ms}
+            - output.turn_off: buzzer_pwm
+
+# ─────────────────────────────────────────────
+# TOUCH SENSOR — GPIO16
+# ─────────────────────────────────────────────
+binary_sensor:
+  - platform: gpio
+    pin: GPIO16
+    name: "Industrial Touch Sensor"
+    on_press:
+      - script.execute: buzzer_blip
+
+# ─────────────────────────────────────────────
+# SIMPLE ON/OFF SWITCHES — buzzer mute + OLED power
+# ─────────────────────────────────────────────
+switch:
+  - platform: template
+    name: "Buzzer"
+    id: buzzer_enable
+    icon: "mdi:volume-high"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+
+  - platform: template
+    name: "OLED Display"
+    id: oled_enable
+    icon: "mdi:monitor"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    turn_on_action:
+      - lambda: 'id(oled).turn_on();'
+    turn_off_action:
+      - lambda: 'id(oled).turn_off();'
+
+# ─────────────────────────────────────────────
+# OLED — sda/scl swapped per correction
+# ─────────────────────────────────────────────
+i2c:
+  sda: GPIO21
+  scl: GPIO4
+  frequency: 400kHz #change it to 800khz and see if display is stable.increasing this can increase the smoothness of leds
+
+font:
+  - file: "gfonts://Roboto Mono@700"
+    id: font_vol_big
+    size: 28
+  - file: "gfonts://Roboto"
+    id: font_small
+    size: 11
+
+# ─────────────────────────────────────────────
+# DISPLAY CONTRAST — simple slider, 0-100%
+# ─────────────────────────────────────────────
+number:
+  - platform: template
+    name: "Display Contrast"
+    id: oled_contrast
+    icon: "mdi:brightness-6"
+    min_value: 0
+    max_value: 100
+    step: 5
+    initial_value: 100
+    optimistic: true
+    unit_of_measurement: "%"
+    on_value:
+      then:
+        - lambda: |-
+            id(oled).set_contrast(x / 100.0f);
+
+display:
+  - platform: ssd1306_i2c
+    id: oled
+    model: "SSD1306 128x64"
+    address: 0x3C
+    update_interval: ${oled_normal_interval}
+    lambda: |-
+      auto W = COLOR_ON;
+      uint32_t now = millis();
+
+      // ============================================================
+      // dynamic refresh rate: slow down while the volume page is up,
+      // since it needs no fast animation and this frees up loop time
+      // for the LED trail / buzzer so they don't lag.
+      //
+      // NOTE: set_update_interval() alone only changes the stored
+      // value — the scheduler's actual repeating timer was armed
+      // once at boot with the old interval and won't pick up a new
+      // one on its own. stop_poller() + start_poller() re-arms it,
+      // which is what actually makes the new interval take effect.
+      // ============================================================
+      bool vol_recent = (now - id(g_last_volume_change_ms)) < ${volume_page_ms};
+      if (vol_recent != id(g_was_vol_recent)) {
+        id(oled).stop_poller();
+        id(oled).set_update_interval(vol_recent ? ${oled_volume_interval_num} : ${oled_normal_interval_num});
+        id(oled).start_poller();
+        id(g_was_vol_recent) = vol_recent;
+      }
+
+      // ============================================================
+      // VOLUME PAGE — takes over the whole screen, no face underneath
+      // ============================================================
+      if (vol_recent) {
+        int pct = (int)(id(g_current_volume) * 100.0f + 0.5f);
+        it.print(64, 4, id(font_small), W, TextAlign::TOP_CENTER, "VOLUME");
+
+        char buf[6];
+        snprintf(buf, sizeof(buf), "%d%%", pct);
+        it.print(64, 16, id(font_vol_big), W, TextAlign::TOP_CENTER, buf);
+
+        // direction chevron next to the number
+        int chev_x = 100, chev_y = 30;
+        if (id(g_volume_direction) >= 0) {
+          it.line(chev_x - 4, chev_y + 3, chev_x, chev_y - 3, W);
+          it.line(chev_x, chev_y - 3, chev_x + 4, chev_y + 3, W);
+        } else {
+          it.line(chev_x - 4, chev_y - 3, chev_x, chev_y + 3, W);
+          it.line(chev_x, chev_y + 3, chev_x + 4, chev_y - 3, W);
+        }
+
+        // rounded progress bar
+        int bar_x = 12, bar_y = 50, bar_w = 104, bar_h = 10, r = 5;
+        it.rectangle(bar_x, bar_y, bar_w, bar_h, W);
+        int fill_w = (int)((bar_w - 4) * id(g_current_volume));
+        if (fill_w > 0) it.filled_rectangle(bar_x + 2, bar_y + 2, fill_w, bar_h - 4, W);
+        return;
+      }
+
+      // ============================================================
+      // BLINK STATE MACHINE — runs continuously; occasionally blinks
+      // once or twice in a row, then waits a random while before doing
+      // it again.
+      // ============================================================
+      if (id(g_blink_active)) {
+        uint32_t elapsed = now - id(g_blink_start_ms);
+        uint32_t total = ${blink_close_ms} + ${blink_open_ms};
+        if (elapsed >= total) {
+          id(g_blink_active) = false;
+          if (id(g_blinks_remaining) > 0) {
+            // quick follow-up blink to make a natural double-blink
+            id(g_next_blink_ms) = now + 150 + (uint32_t)(rand() % 200);
+          } else {
+            id(g_blinks_remaining) = 1 + (rand() % 2);
+            uint32_t lo = ${blink_interval_min_ms}, hi = ${blink_interval_max_ms};
+            id(g_next_blink_ms) = now + lo + (uint32_t)(rand() % (hi - lo));
+          }
+        }
+      } else if (now >= id(g_next_blink_ms)) {
+        id(g_blink_active) = true;
+        id(g_blink_start_ms) = now;
+        id(g_blinks_remaining) -= 1;
+      }
+
+      // ============================================================
+      // EXPRESSION STATE MACHINE — picks one of two little
+      // expressions at random: LOOK (slide + a lopsided lean) or
+      // HALF-OPEN (sleepy droop). Only one plays at a time, so they
+      // never fight each other.
+      // ============================================================
+      if (id(g_expr_active)) {
+        if (now - id(g_expr_start_ms) >= id(g_expr_duration_ms)) {
+          id(g_expr_active) = false;
+          uint32_t lo = ${expr_interval_min_ms}, hi = ${expr_interval_max_ms};
+          id(g_next_expr_ms) = now + lo + (uint32_t)(rand() % (hi - lo));
+        }
+      } else if (now >= id(g_next_expr_ms)) {
+        id(g_expr_active) = true;
+        id(g_expr_start_ms) = now;
+        int roll = rand() % 100;
+        if (roll < 55) {
+          id(g_expr_type) = 0; // LOOK
+          uint32_t ldlo = ${eye_move_duration_min_ms}, ldhi = ${eye_move_duration_max_ms};
+          id(g_expr_duration_ms) = ldlo + (uint32_t)(rand() % (ldhi - ldlo));
+          int rx = ${eye_move_range_x_px}, ry = ${eye_move_range_y_px};
+          id(g_expr_dx) = rx > 0 ? (int)(rand() % (2 * rx + 1)) - rx : 0;
+          id(g_expr_dy) = ry > 0 ? (int)(rand() % (2 * ry + 1)) - ry : 0;
+          id(g_expr_dir) = (id(g_expr_dx) >= 0) ? 1 : -1;
+        } else {
+          id(g_expr_type) = 1; // HALF-OPEN
+          uint32_t sdlo = ${half_open_duration_min_ms}, sdhi = ${half_open_duration_max_ms};
+          id(g_expr_duration_ms) = sdlo + (uint32_t)(rand() % (sdhi - sdlo));
+        }
+      }
+
+      // ============================================================
+      // SMILE STATE MACHINE — checked periodically, but only actually
+      // shows up some of the time, so it feels like a spontaneous
+      // little expression rather than a fixed pattern.
+      // ============================================================
+      if (id(g_smile_active)) {
+        if (now - id(g_smile_start_ms) >= id(g_smile_duration_ms)) {
+          id(g_smile_active) = false;
+          uint32_t lo = ${smile_interval_min_ms}, hi = ${smile_interval_max_ms};
+          id(g_next_smile_ms) = now + lo + (uint32_t)(rand() % (hi - lo));
+        }
+      } else if (now >= id(g_next_smile_ms)) {
+        uint32_t lo = ${smile_interval_min_ms}, hi = ${smile_interval_max_ms};
+        id(g_next_smile_ms) = now + lo + (uint32_t)(rand() % (hi - lo));
+        if ((int)(rand() % 100) < ${smile_probability_pct}) {
+          id(g_smile_active) = true;
+          id(g_smile_start_ms) = now;
+          uint32_t sdlo = ${smile_duration_min_ms}, sdhi = ${smile_duration_max_ms};
+          id(g_smile_duration_ms) = sdlo + (uint32_t)(rand() % (sdhi - sdlo));
+        }
+      }
+
+      // ============================================================
+      // RENDER PARAMETERS derived from state
+      // ============================================================
+      float closedness = 0.0f;
+      if (id(g_blink_active)) {
+        uint32_t elapsed = now - id(g_blink_start_ms);
+        float close_dur = ${blink_close_ms};
+        float open_dur = ${blink_open_ms};
+        if (elapsed < close_dur) {
+          closedness = elapsed / close_dur;
+        } else {
+          float ratio = (elapsed - close_dur) / open_dur;
+          if (ratio > 1.0f) ratio = 1.0f;
+          closedness = 1.0f - ratio;
+        }
+      }
+      if (closedness < 0.0f) closedness = 0.0f;
+      if (closedness > 1.0f) closedness = 1.0f;
+
+      // dance: continuous bob + squash/stretch while media plays
+      // (extra_close, from HALF-OPEN, gets folded in below once it's computed)
+      float bob_y = 0.0f, squish = 1.0f;
+      if (id(media_state).state == "playing") {
+        float t = now / (float)${dance_period_ms};
+        float phase = t * 2.0f * 3.14159265f;
+        bob_y = sinf(phase) * ${dance_bob_amp_px};
+        squish = 1.0f + 0.08f * sinf(phase + 1.5707963f);
+      }
+
+      // ---- expression envelope + per-type render values ----
+      float expr_progress = 0.0f;
+      if (id(g_expr_active)) {
+        expr_progress = (now - id(g_expr_start_ms)) / (float)id(g_expr_duration_ms);
+        if (expr_progress > 1.0f) expr_progress = 1.0f;
+      }
+      // generic ramp-in / hold / ramp-out envelope, reused by LOOK and HALF-OPEN
+      float env = 0.0f;
+      if (id(g_expr_active)) {
+        if (expr_progress < 0.2f) env = expr_progress / 0.2f;
+        else if (expr_progress > 0.8f) env = (1.0f - expr_progress) / 0.2f;
+        else env = 1.0f;
+      }
+
+      int shift_x = 0, shift_y = 0;
+      float lean_left = 1.0f, lean_right = 1.0f;  // per-eye size (the lopsided lean)
+      float extra_close = 0.0f;                    // sleepy droop, blended with blink below
+
+      if (id(g_expr_active) && id(g_expr_type) == 0) {
+        // LOOK — pair slides to a spot, and the leading eye leans a
+        // touch bigger while the trailing eye leans a touch smaller
+        shift_x = (int)(id(g_expr_dx) * env);
+        shift_y = (int)(id(g_expr_dy) * env);
+        if (id(g_expr_dir) > 0) {
+          lean_right = 1.0f + (${eye_lean_big_scale}   - 1.0f) * env;
+          lean_left  = 1.0f - (1.0f - ${eye_lean_small_scale}) * env;
+        } else {
+          lean_left  = 1.0f + (${eye_lean_big_scale}   - 1.0f) * env;
+          lean_right = 1.0f - (1.0f - ${eye_lean_small_scale}) * env;
+        }
+      } else if (id(g_expr_active) && id(g_expr_type) == 1) {
+        // HALF-OPEN — both eyelids ease down to a sleepy droop and back,
+        // capped well short of a full close
+        extra_close = ${half_open_amount} * env;
+      }
+
+      // ============================================================
+      // helper: rounded rectangle from filled primitives
+      // ============================================================
+      auto rounded_rect = [&](int x, int y, int w, int h, int rad) {
+        if (w <= 0 || h <= 0) return;
+        if (rad * 2 > w) rad = w / 2;
+        if (rad * 2 > h) rad = h / 2;
+        if (rad < 0) rad = 0;
+        if (rad == 0) { it.filled_rectangle(x, y, w, h, W); return; }
+        it.filled_rectangle(x + rad, y, w - 2 * rad, h, W);
+        it.filled_rectangle(x, y + rad, rad, h - 2 * rad, W);
+        it.filled_rectangle(x + w - rad, y + rad, rad, h - 2 * rad, W);
+        it.filled_circle(x + rad, y + rad, rad, W);
+        it.filled_circle(x + w - rad - 1, y + rad, rad, W);
+        it.filled_circle(x + rad, y + h - rad - 1, rad, W);
+        it.filled_circle(x + w - rad - 1, y + h - rad - 1, rad, W);
+      };
+
+      // ============================================================
+      // DRAW EYES — the pair slides/arcs together as one unit for
+      // movement, but each eye can still lean a bit bigger/smaller
+      // independently (the lopsided LOOK lean), and a HALF-OPEN droop
+      // blends in with a blink so a sleepy eye can still fully close.
+      // ============================================================
+      float total_closedness = closedness;
+      if (extra_close > total_closedness) total_closedness = extra_close;
+      if (total_closedness > 1.0f) total_closedness = 1.0f;
+
+      int base_w = ${eye_width}, base_h = ${eye_height}, gap = ${eye_gap};
+      float eye_scale_y = squish;
+      if (eye_scale_y < 0.15f) eye_scale_y = 0.15f;
+
+      int total_w = base_w * 2 + gap;
+      int start_x = (128 - total_w) / 2 + shift_x;
+      int cy = ${eye_center_y} + (int)bob_y + shift_y;
+
+      int lw = (int)(base_w * lean_left),  lh = (int)(base_h * lean_left  * eye_scale_y);
+      int rw = (int)(base_w * lean_right), rh = (int)(base_h * lean_right * eye_scale_y);
+
+      int l_rendered_h = (int)(lh * (1.0f - total_closedness)); if (l_rendered_h < 2) l_rendered_h = 2;
+      int r_rendered_h = (int)(rh * (1.0f - total_closedness)); if (r_rendered_h < 2) r_rendered_h = 2;
+
+      int left_cx  = start_x + base_w / 2;
+      int right_cx = start_x + base_w + gap + base_w / 2;
+
+      rounded_rect(left_cx - lw / 2, cy - l_rendered_h / 2, lw, l_rendered_h, ${eye_corner_radius});
+      rounded_rect(right_cx - rw / 2, cy - r_rendered_h / 2, rw, r_rendered_h, ${eye_corner_radius});
+
+      // ============================================================
+      // DRAW SMILE — pops in/out with a little grow/shrink, only when
+      // g_smile_active decided (randomly) to show itself this round.
+      // ============================================================
+      if (id(g_smile_active)) {
+        float sp = (now - id(g_smile_start_ms)) / (float)id(g_smile_duration_ms);
+        if (sp > 1.0f) sp = 1.0f;
+        float pop = (sp < 0.15f) ? (sp / 0.15f) : ((sp > 0.85f) ? (1.0f - sp) / 0.15f : 1.0f);
+        if (pop < 0.0f) pop = 0.0f;
+        if (pop > 1.0f) pop = 1.0f;
+        int r = (int)(${smile_radius_px} * pop);
+        if (r > 1) {
+          int scx = 64 + shift_x / 2;
+          int scy = ${smile_center_y};
+          it.filled_circle(scx, scy, r, W);
+          it.filled_rectangle(scx - r - 1, scy - r - 1, (r + 1) * 2, r + 1, COLOR_OFF);
+        }
+      }
+
+# ─────────────────────────────────────────────
+# WS2812 LED RING — 16 LEDs, comet trail synced to knob rotation
+# ─────────────────────────────────────────────
+light:
+  - platform: esp32_rmt_led_strip
+    id: led_strip
+    name: "LED Ring"
+    pin: GPIO27
+    num_leds: ${num_pixels}
+    chipset: ws2812
+    rgb_order: GRB
+    effects:
+      - addressable_lambda:
+          name: "Knob Trail"
+          update_interval: 16ms
+          lambda: |-
+            uint32_t now = millis();
+            const float fade_in = (float)${led_fade_in_ms};
+            const float trail = (float)${pixel_trail_time_ms};
+            for (int i = 0; i < it.size(); i++) {
+              uint32_t last = id(g_pixel_last_set)[i];
+              float b = 0.0f;
+              if (last != 0) {
+                float elapsed = (float)(now - last);
+                if (elapsed < fade_in) {
+                  b = elapsed / fade_in;
+                } else {
+                  b = 1.0f - (elapsed - fade_in) / (trail - fade_in);
+                }
+                if (b < 0.0f) b = 0.0f;
+                if (b > 1.0f) b = 1.0f;
+              }
+              it[i] = Color((uint8_t)(20 * b), (uint8_t)(160 * b), (uint8_t)(255 * b));
+            }
