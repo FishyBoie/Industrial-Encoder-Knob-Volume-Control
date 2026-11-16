@@ -38,7 +38,7 @@ just copy the yaml from the industrial-encoder-knob.yaml and paste it after your
 Wiring:
 
 
-GPIO	Connects to
+
 GPIO13	Rotary encoder — Pin A
 
 GPIO14	Rotary encoder — Pin B
